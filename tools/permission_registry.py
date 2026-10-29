@@ -32,6 +32,7 @@ from typing import (
     overload,
 )
 
+# pyrefly: ignore[missing-import]
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from LegionADK.core.llm_spec import CancellationToken, LLMSpec

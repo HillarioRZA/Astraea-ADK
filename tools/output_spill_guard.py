@@ -20,6 +20,7 @@ import time
 import uuid
 from typing import Any, Optional, Union
 
+# pyrefly: ignore[missing-import]
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("LegionADK.tools.output_spill_guard")
