@@ -72,7 +72,8 @@ def finalize_turn(
     tool_results: Tuple[Dict[str, Any], ...] = tuple(all_tool_results)
 
     # 4. Evaluasi kekosongan giliran
-    empty = (sum(len(ao.tool_calls) for ao, _ in rounds) == 0)
+    has_progress = any(bool(ao.tool_calls) or bool(ao.content and ao.content.strip()) for ao, _ in rounds)
+    empty = not has_progress
 
     # 5. Bangun SessionState baru
     new_state = initial_state.with_history(new_history).record_turn(

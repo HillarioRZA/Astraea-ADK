@@ -23,6 +23,7 @@ from typing import (
     Tuple,
 )
 
+from LegionADK.gateway.cache_boundary import assemble_cached_system_prompt_from_spec
 from LegionADK.gateway.model_router import ModelRouter
 from LegionADK.governance.cov_verifier import DeterministicVerifier
 from LegionADK.governance.smart_guardian import GovernanceEvent
@@ -31,6 +32,7 @@ from LegionADK.runtime.turn_compaction import (
     SystemOverheadExceededError,
     check_turn_loop_circuit_breaker,
     compact_context_two_tier,
+    estimate_tokens,
 )
 from LegionADK.runtime.turn_finalizer import finalize_turn
 from LegionADK.runtime.turn_preflight import run_preflight
@@ -89,14 +91,42 @@ async def execute_turn(
     if not pre.can_proceed:
         return _hasil_awal(session_state, pre.status, pre.reason)
 
-    # Fase 9a: Context Compaction
+    # Fase 9a: Context Compaction & Budget Synchronization
     if active_policy.context_token_budget is None:
         history_for_request = list(session_state.history)
     else:
         try:
+            # 1. Rakit system_prompt terlebih dahulu via cache_boundary
+            # (sekaligus memvalidasi Lapisan 1 SystemOverheadExceededError)
+            parts: List[str] = [f"Pengirim: {envelope.sender}"]
+            if envelope.reply_to is not None:
+                parts.append(f"Membalas pesan: {envelope.reply_to}")
+            if envelope.attachments:
+                parts.append(f"Lampiran: {', '.join(envelope.attachments)}")
+            if dynamic_context.strip():
+                parts.append(dynamic_context)
+            assembled_context = "\n\n".join(parts)
+
+            system_prompt, _, _ = assemble_cached_system_prompt_from_spec(
+                spec,
+                dynamic_context=assembled_context,
+                max_token_budget=active_policy.context_token_budget,
+            )
+
+            # 2. Hitung overhead token (system prompt + konten pesan user envelope)
+            overhead_tokens = estimate_tokens(system_prompt) + estimate_tokens(envelope.content)
+            budget_for_history = active_policy.context_token_budget - overhead_tokens
+
+            if budget_for_history < 0:
+                raise SystemOverheadExceededError(
+                    f"Overhead prompt ({overhead_tokens} tokens) melampaui context_token_budget "
+                    f"({active_policy.context_token_budget} tokens)."
+                )
+
+            # 3. Jalankan compact_context_two_tier dengan sisa jatah budget untuk riwayat
             history_for_request = compact_context_two_tier(
                 list(session_state.history),
-                max_token_budget=active_policy.context_token_budget,
+                max_token_budget=budget_for_history,
             )
         except SystemOverheadExceededError as exc:
             return _hasil_awal(session_state, "BUDGET_EXCEEDED", str(exc))
@@ -213,8 +243,8 @@ async def execute_turn(
             break
 
     # Fase 9b: Loop Guard
-    any_tools = any(len(ao.tool_calls) > 0 for ao, _ in rounds)
-    candidate = 0 if any_tools else session_state.consecutive_empty_turns + 1
+    has_progress = any(bool(ao.tool_calls) or bool(ao.content and ao.content.strip()) for ao, _ in rounds)
+    candidate = 0 if has_progress else session_state.consecutive_empty_turns + 1
     tripped, trip_message = check_turn_loop_circuit_breaker(
         candidate,
         max_allowed=active_policy.max_consecutive_empty_turns,
