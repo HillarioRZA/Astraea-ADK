@@ -88,45 +88,30 @@ def run_preflight(
     metode pencatat state internal.
     """
     # 1. Token batal: gagal pertama menang
-    if token is not None:
-        is_cancelled = (
-            token.is_cancelled()
-            if callable(getattr(token, "is_cancelled", None))
-            else getattr(token, "is_cancelled", False)
+    if token is not None and token.is_cancelled:
+        raw_reason = token.reason
+        reason_str = str(raw_reason).strip() if raw_reason else ""
+        reason = (
+            reason_str
+            if reason_str
+            else "Giliran dibatalkan sebelum dimulai: token pembatalan aktif."
         )
-        if is_cancelled:
-            raw_reason = (
-                token.reason()
-                if callable(getattr(token, "reason", None))
-                else getattr(token, "reason", None)
-            )
-            reason_str = str(raw_reason).strip() if raw_reason else ""
-            reason = (
-                reason_str
-                if reason_str
-                else "Giliran dibatalkan sebelum dimulai: token pembatalan aktif."
-            )
-            return PreflightResult(
-                can_proceed=False,
-                status="CANCELLED",
-                reason=reason,
-            )
+        return PreflightResult(
+            can_proceed=False,
+            status="CANCELLED",
+            reason=reason,
+        )
 
     # 2. Guardian terminate: get_session_level dipanggil tepat satu kali
-    if guardian is not None:
-        level_fn = getattr(guardian, "get_session_level", None) or getattr(
-            guardian, "get_session_action", None
+    if guardian is not None and guardian.get_session_action(state.session_id) == "TERMINATE":
+        return PreflightResult(
+            can_proceed=False,
+            status="TERMINATED",
+            reason=(
+                f"Sesi '{state.session_id}' telah diterminasi oleh SmartGuardian: "
+                f"level eskalasi mencapai TERMINATE."
+            ),
         )
-        if level_fn is not None and level_fn(state.session_id) == "TERMINATE":
-            return PreflightResult(
-                can_proceed=False,
-                status="TERMINATED",
-                reason=(
-                    f"Sesi '{state.session_id}' telah diterminasi oleh SmartGuardian: "
-                    f"level eskalasi mencapai TERMINATE."
-                ),
-            )
-
     # 3. Breaker putaran
     if state.consecutive_empty_turns >= policy.max_consecutive_empty_turns:
         return PreflightResult(
