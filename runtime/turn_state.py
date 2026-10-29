@@ -1,7 +1,7 @@
 """
 Kontrak murni status sesi dan kebijakan giliran untuk paket runtime/turn LegionADK.
 
-Modul ini mendefinisikan model-model Pydantic v2 deep-frozen yang mengatur:
+Modul ini mendefinisikan model-model Pydantic v2 frozen yang mengatur:
 - SessionState: Keadaan sesi yang dibawa pemanggil antar giliran (in-memory state).
 - TurnPolicy: Konfigurasi batas operasional dan timeout eksekusi giliran.
 - TurnResult: Hasil terstruktur dari eksekusi satu giliran agen.
@@ -32,7 +32,7 @@ class SessionState(BaseModel):
     """
     State sesi percakapan yang dibawa pemanggil antar giliran.
     Engine runtime tidak pernah menyimpan atau mempertahankan state ini secara internal.
-    Deep-frozen dan immutable.
+    Frozen dan immutable.
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -131,7 +131,7 @@ class SessionState(BaseModel):
 class TurnPolicy(BaseModel):
     """
     Kebijakan dan batas operasional eksekusi giliran pada runtime loop.
-    Deep-frozen dan immutable.
+    Frozen dan immutable.
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -174,7 +174,7 @@ class TurnPolicy(BaseModel):
 class TurnResult(BaseModel):
     """
     Hasil akhir terstruktur dari eksekusi satu giliran agen pada runtime.
-    Deep-frozen dan immutable.
+    Frozen dan immutable.
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -212,7 +212,7 @@ class TurnResult(BaseModel):
     rounds_used: int = Field(
         default=0,
         ge=0,
-        description="Jumlah putaran tool yang digunakan dalam giliran ini",
+        description="Jumlah panggilan model yang terjadi dalam giliran ini",
     )
     session_state: SessionState = Field(
         ...,
