@@ -142,16 +142,30 @@ async def execute_tool_round(
     last_guardian_report: Optional[GuardianReport] = None
 
     for entry in repaired:
-        name = entry.get("name", "")
-        arguments = entry.get("arguments", {})
-        tool_call_id = entry.get("id", "")
+        if "function" in entry and isinstance(entry["function"], dict):
+            fn_block = entry["function"]
+            name = str(fn_block.get("name", ""))
+            arguments = fn_block.get("arguments", {})
+        else:
+            name = str(entry.get("name", entry.get("tool_id", "")))
+            arguments = entry.get("arguments", entry.get("parameters", {}))
+
+        tool_call_id = str(entry.get("id", ""))
         if arguments is None:
             arguments = {}
         if isinstance(arguments, str):
             try:
-                arguments = json.loads(arguments)
+                parsed_args = json.loads(arguments)
+                arguments = parsed_args if isinstance(parsed_args, dict) else {"_raw": arguments}
             except json.JSONDecodeError:
-                pass
+                # Tandai argumen rusak agar tertangkap sebagai invalid_arguments
+                results.append({
+                    "tool_call_id": tool_call_id,
+                    "tool_name": name,
+                    "status": "invalid_arguments",
+                    "error": f"Argumen JSON untuk tool '{name}' tidak valid setelah repair.",
+                })
+                continue
 
         # 1. Tanda tangan dan Breaker
         signature = compute_tool_signature(name, arguments)
@@ -209,7 +223,7 @@ async def execute_tool_round(
                     if dec1.report is not None:
                         last_guardian_report = dec1.report
 
-                    if verdict.limit_reached:
+                    if verdict.limit_reached and dec1.action not in ("FORCE_REPORT", "TERMINATE"):
                         dec2 = guardian.observe_event(
                             GovernanceEvent(
                                 kind="REJECTION_LIMIT_REACHED",
@@ -243,7 +257,20 @@ async def execute_tool_round(
                 "error": str(exc),
             })
             if signature_breaker is not None:
-                signature_breaker.record_tool_outcome(session_id, signature, False)
+                was_open = signature_breaker.is_open(session_id, signature)
+                cb_state = signature_breaker.record_tool_outcome(session_id, signature, False)
+                if not was_open and cb_state.status == "OPEN" and guardian is not None:
+                    dec_cb = guardian.observe_event(
+                        GovernanceEvent(
+                            kind="CIRCUIT_OPENED",
+                            session_id=session_id,
+                            tool_name=name,
+                            detail=signature,
+                        )
+                    )
+                    last_guardian_action = dec_cb.action
+                    if dec_cb.report is not None:
+                        last_guardian_report = dec_cb.report
         except ToolExecutionError as exc:
             results.append({
                 "tool_call_id": tool_call_id,
@@ -252,7 +279,20 @@ async def execute_tool_round(
                 "error": str(exc),
             })
             if signature_breaker is not None:
-                signature_breaker.record_tool_outcome(session_id, signature, False)
+                was_open = signature_breaker.is_open(session_id, signature)
+                cb_state = signature_breaker.record_tool_outcome(session_id, signature, False)
+                if not was_open and cb_state.status == "OPEN" and guardian is not None:
+                    dec_cb = guardian.observe_event(
+                        GovernanceEvent(
+                            kind="CIRCUIT_OPENED",
+                            session_id=session_id,
+                            tool_name=name,
+                            detail=signature,
+                        )
+                    )
+                    last_guardian_action = dec_cb.action
+                    if dec_cb.report is not None:
+                        last_guardian_report = dec_cb.report
         except ToolPermissionError:
             results.append({
                 "tool_call_id": tool_call_id,
