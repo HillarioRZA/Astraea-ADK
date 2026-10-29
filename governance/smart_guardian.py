@@ -299,18 +299,12 @@ class SmartGuardian:
             elif event.kind == "REJECTION_LIMIT_REACHED":
                 event_is_breach = True
                 if event.tool_name:
-                    count = max(
-                        sess.rejection_counts.get(event.tool_name, 0),
-                        self.policy.max_rejections_per_tool,
-                    )
-                    sess.rejection_counts[event.tool_name] = count
                     breach_reasons.append(
-                        f"Batas penolakan verifikasi CoV tercapai seketika untuk tool '{event.tool_name}' "
-                        f"({count}/{self.policy.max_rejections_per_tool})."
+                        f"Sinyal REJECTION_LIMIT_REACHED diterima dari verifier untuk tool '{event.tool_name}'."
                     )
                 else:
                     breach_reasons.append(
-                        "Batas penolakan verifikasi CoV tercapai seketika untuk sesi umum."
+                        "Sinyal REJECTION_LIMIT_REACHED diterima dari verifier untuk sesi umum."
                     )
             elif event.kind == "CIRCUIT_OPENED":
                 sess.circuit_trips += 1
