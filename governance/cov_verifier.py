@@ -272,8 +272,12 @@ class DeterministicVerifier:
                         f"Argumen '{clean_arg_name}' ditolak: mengandung pola path traversal '..' pada segmen path."
                     )
 
-                # Periksa path absolut terhadap allowed_root
-                if os.path.isabs(val) and self.allowed_root:
+                # Periksa path absolut atau berakar terhadap allowed_root.
+                # Path berakar tanpa drive diselesaikan Windows terhadap drive saat ini,
+                # dan os.path.isabs pada Python 3.13+ tidak menganggapnya absolut.
+                _, path_tail = os.path.splitdrive(val)
+                is_rooted = path_tail.startswith(("/", "\\"))
+                if self.allowed_root and (os.path.isabs(val) or is_rooted):
                     norm_val = os.path.abspath(val)
                     norm_root = os.path.abspath(self.allowed_root)
                     try:
