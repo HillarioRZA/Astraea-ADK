@@ -1,6 +1,7 @@
 """
 Runtime module for LegionADK.
 Provides turn compaction, circuit breaker, and agent execution controls.
+Menyediakan turn engine orchestrator (execute_turn) dan kontrak status sesi agen.
 """
 
 from LegionADK.runtime.turn_compaction import (
@@ -19,6 +20,10 @@ from LegionADK.runtime.turn_compaction import (
     check_turn_loop_circuit_breaker,
     compact_turn_history,
 )
+from LegionADK.runtime.turn_api import TurnTimeoutError
+from LegionADK.runtime.turn_facade import execute_turn
+from LegionADK.runtime.turn_preflight import PreflightResult
+from LegionADK.runtime.turn_state import SessionState, TurnPolicy, TurnResult
 
 __all__ = [
     "COMPACTED_SUMMARY_MARKER",
@@ -35,4 +40,10 @@ __all__ = [
     "compact_context_two_tier",
     "check_turn_loop_circuit_breaker",
     "compact_turn_history",
+    "SessionState",
+    "TurnPolicy",
+    "TurnResult",
+    "PreflightResult",
+    "TurnTimeoutError",
+    "execute_turn",
 ]
