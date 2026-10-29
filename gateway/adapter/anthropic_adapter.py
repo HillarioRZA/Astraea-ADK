@@ -17,8 +17,64 @@ logger = logging.getLogger("LegionADK.gateway.adapter.anthropic")
 
 from LegionADK.gateway.adapter.base_adapter import BaseLLMAdapter
 
+import copy
+
 if TYPE_CHECKING:
     from LegionADK.core.llm_spec import CancellationToken
+
+
+def _normalize_content_to_blocks(content: Any) -> List[Dict[str, Any]]:
+    """Menormalisasi konten pesan ke format list of content blocks Anthropic."""
+    if isinstance(content, list):
+        return list(content)
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content.strip() else []
+    if content is None:
+        return []
+    return [{"type": "text", "text": str(content)}]
+
+
+def _merge_two_messages(prev: Dict[str, Any], curr: Dict[str, Any]) -> Dict[str, Any]:
+    """Menggabungkan dua pesan berurutan yang memiliki role sama menjadi satu pesan tunggal."""
+    prev_c = prev.get("content", "")
+    curr_c = curr.get("content", "")
+
+    if isinstance(prev_c, str) and isinstance(curr_c, str):
+        if prev_c and curr_c:
+            merged_content: Any = f"{prev_c}\n\n{curr_c}"
+        else:
+            merged_content = prev_c or curr_c
+    else:
+        merged_content = _normalize_content_to_blocks(prev_c) + _normalize_content_to_blocks(curr_c)
+
+    res = dict(prev)
+    res["content"] = merged_content
+    return res
+
+
+def _merge_consecutive_same_role_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Menggabungkan pesan-pesan berurutan yang memiliki role identik
+    (misal user + user atau assistant + assistant) menjadi satu pesan tunggal.
+    Menegakkan invarian alternasi role ketat pada Anthropic Messages API.
+    """
+    if not messages:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not merged:
+            merged.append(dict(msg))
+            continue
+
+        if merged[-1].get("role") == msg.get("role"):
+            merged[-1] = _merge_two_messages(merged[-1], msg)
+        else:
+            merged.append(dict(msg))
+
+    return merged
 
 
 class AnthropicAdapter(BaseLLMAdapter):
@@ -129,6 +185,13 @@ class AnthropicAdapter(BaseLLMAdapter):
                 user_content = content_parts
 
             anthropic_messages.append({"role": "user", "content": user_content})
+
+        # Gabungkan pesan berurutan yang memiliki role identik sebelum dikirim ke Anthropic
+        anthropic_messages = _merge_consecutive_same_role_messages(anthropic_messages)
+
+        # Invarian Anthropic: pesan pertama wajib ber-role 'user'
+        if anthropic_messages and anthropic_messages[0]["role"] != "user":
+            anthropic_messages.insert(0, {"role": "user", "content": "(Melanjutkan sesi percakapan)"})
 
         # 2. Siapkan payload request
         effective_max_tokens = max_tokens if (max_tokens is not None and max_tokens > 0) else 4096

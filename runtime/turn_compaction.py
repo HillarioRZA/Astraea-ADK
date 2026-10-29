@@ -325,8 +325,18 @@ def summarize_oldest_history(
 
     result: List[Dict[str, Any]] = []
     result.extend(head)
-    result.append(summary_message)
-    result.extend(copy.deepcopy(tail_slice))
+
+    # Cegah dua pesan berurutan dengan role sama jika tail_slice diawali pesan user
+    if tail_slice and tail_slice[0].get("role") == summary_role:
+        first_tail = copy.deepcopy(tail_slice[0])
+        first_tail_content = str(first_tail.get("content", ""))
+        first_tail["content"] = f"{summary_text}\n\n{first_tail_content}"
+        result.append(first_tail)
+        result.extend(copy.deepcopy(tail_slice[1:]))
+    else:
+        result.append(summary_message)
+        result.extend(copy.deepcopy(tail_slice))
+
     return strip_internal_metadata(result)  # type: ignore
 
 

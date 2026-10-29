@@ -21,6 +21,34 @@ if TYPE_CHECKING:
     from LegionADK.core.llm_spec import CancellationToken
 
 
+def _merge_consecutive_same_role_contents(
+    contents: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Menggabungkan turn-turn berurutan yang memiliki role identik pada Gemini
+    (misal user + user atau model + model) dengan menyatukan daftar parts-nya.
+    Menegakkan aturan alternasi turn ketat pada Google Gemini API.
+    """
+    if not contents:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+    for turn in contents:
+        if not merged:
+            merged.append(dict(turn))
+            continue
+
+        if merged[-1].get("role") == turn.get("role"):
+            merged[-1] = {
+                "role": merged[-1]["role"],
+                "parts": list(merged[-1].get("parts", [])) + list(turn.get("parts", [])),
+            }
+        else:
+            merged.append(dict(turn))
+
+    return merged
+
+
 class GeminiAdapter(BaseLLMAdapter):
     """Adapter untuk Google Gemini via REST API murni tanpa vendor SDK."""
 
@@ -159,6 +187,13 @@ class GeminiAdapter(BaseLLMAdapter):
                     })
             parts.append({"text": prompt})
             contents.append({"role": "user", "parts": parts})
+
+        # Gabungkan turn berurutan yang memiliki role sama sebelum dikirim ke Gemini
+        contents = _merge_consecutive_same_role_contents(contents)
+
+        # Invarian Gemini: turn pertama dalam contents wajib ber-role 'user'
+        if contents and contents[0]["role"] != "user":
+            contents.insert(0, {"role": "user", "parts": [{"text": "(Melanjutkan sesi percakapan)"}]})
 
         # 2. Siapkan payload request
         generation_config: Dict[str, Any] = {
