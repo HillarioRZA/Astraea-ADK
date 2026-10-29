@@ -142,36 +142,16 @@ async def execute_tool_round(
     last_guardian_report: Optional[GuardianReport] = None
 
     for entry in repaired:
-        name = ""
-        arguments: Any = None
-        tool_call_id = ""
-
-        if isinstance(entry, dict):
-            name = entry.get("name", "")
-            arguments = entry.get("arguments")
-            tool_call_id = entry.get("id", "")
-
-            # Tangani format function call bersarang (OpenAI style) bila name kosong
-            if not name and "function" in entry and isinstance(entry["function"], dict):
-                name = entry["function"].get("name", "")
-                if arguments is None:
-                    arguments = entry["function"].get("arguments")
-
-            # Fallback ke tool_id/parameters bila format custom
-            if not name:
-                name = entry.get("tool_id", "") or entry.get("tool", "")
-            if arguments is None and "parameters" in entry:
-                arguments = entry.get("parameters")
-
-        # Parsing string arguments JSON hasil repair bila ada
+        name = entry.get("name", "")
+        arguments = entry.get("arguments", {})
+        tool_call_id = entry.get("id", "")
+        if arguments is None:
+            arguments = {}
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
-            except Exception:
+            except json.JSONDecodeError:
                 pass
-
-        if not isinstance(arguments, dict):
-            arguments = {} if arguments is None else arguments
 
         # 1. Tanda tangan dan Breaker
         signature = compute_tool_signature(name, arguments)
