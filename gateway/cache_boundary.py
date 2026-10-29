@@ -118,6 +118,8 @@ def assemble_cached_system_prompt(
     dynamic_context: str = "",
     agent_name: str = "",
     handle: str = "",
+    max_token_budget: Optional[int] = None,
+    max_static_ratio: float = 0.6,
 ) -> Tuple[str, str, str]:
     """
     Merakit system prompt berlapis dengan batas byte-stable prompt cache.
@@ -175,6 +177,18 @@ def assemble_cached_system_prompt(
 
     stable_prefix = "\n".join(upper_parts).strip()
 
+    # Guard Lapisan 1: validasi alokasi overhead static system prompt
+    if max_token_budget is not None:
+        from LegionADK.runtime.turn_compaction import SystemOverheadExceededError, estimate_tokens
+        prefix_tokens = estimate_tokens(stable_prefix)
+        allowed_tokens = int(max_token_budget * max_static_ratio)
+        if prefix_tokens > allowed_tokens:
+            raise SystemOverheadExceededError(
+                f"Static system prompt overhead ({prefix_tokens} tokens) melampaui batas alokasi "
+                f"statis {int(max_static_ratio * 100)}% dari budget ({allowed_tokens}/{max_token_budget} tokens). "
+                f"Kurangi panjang persona_prompt, SOP, atau skema tools."
+            )
+
     # Penghitung hash SHA-256 system_prompt_digest murni di RAM
     system_prompt_digest = compute_sha256_digest(stable_prefix)
 
@@ -191,6 +205,8 @@ def assemble_cached_system_prompt(
 def assemble_cached_system_prompt_from_spec(
     spec: LLMSpec,
     dynamic_context: str = "",
+    max_token_budget: Optional[int] = None,
+    max_static_ratio: float = 0.6,
 ) -> Tuple[str, str, str]:
     """
     Helper untuk merakit cached system prompt langsung dari objek LLMSpec.
@@ -198,6 +214,19 @@ def assemble_cached_system_prompt_from_spec(
     sehingga digest SHA-256 identik 100% dengan compile_identity.
     """
     stable_prefix = spec.compile_identity()
+
+    # Guard Lapisan 1: validasi alokasi overhead static system prompt
+    if max_token_budget is not None:
+        from LegionADK.runtime.turn_compaction import SystemOverheadExceededError, estimate_tokens
+        prefix_tokens = estimate_tokens(stable_prefix)
+        allowed_tokens = int(max_token_budget * max_static_ratio)
+        if prefix_tokens > allowed_tokens:
+            raise SystemOverheadExceededError(
+                f"Static system prompt overhead ({prefix_tokens} tokens) melampaui batas alokasi "
+                f"statis {int(max_static_ratio * 100)}% dari budget ({allowed_tokens}/{max_token_budget} tokens). "
+                f"Kurangi panjang persona_prompt, SOP, atau skema tools."
+            )
+
     system_prompt_digest = compute_sha256_digest(stable_prefix)
     _, tool_digest = sort_tools_alphabetically(spec.tool_permissions)
 
