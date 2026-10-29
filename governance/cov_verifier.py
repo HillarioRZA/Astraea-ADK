@@ -33,17 +33,16 @@ from typing import (
 # pyrefly: ignore[missing-import]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from LegionADK.tools.output_spill_guard import DEFAULT_MAX_OUTPUT_BYTES
-
 if TYPE_CHECKING:
     from LegionADK.core.llm_spec import LLMSpec
     from LegionADK.tools.permission_registry import ToolSpec
 
 logger = logging.getLogger("LegionADK.governance.cov_verifier")
 
-# Pola deteksi injeksi perintah shell:
-# Mengandung &&, ||, $(, backtick, atau ; yang diikuti teks perintah
-COMMAND_INJECTION_PATTERN = re.compile(r"(&&|\|\||\$\(|`|;\s*\S+)")
+# Pola deteksi injeksi/pemisah perintah shell:
+# Mengandung pipa ('|'), ampersand ('&'), backtick, newline ('\n', '\r'), subshell ('$('),
+# atau titik koma (';') yang diikuti karakter perintah
+COMMAND_INJECTION_PATTERN = re.compile(r"([|&`\n\r]|\$\(|;\s*\S+)")
 
 
 # ============================================================================
@@ -62,7 +61,7 @@ class VerificationVerdict(BaseModel):
     risk_tier: Literal[0, 1, 2] = Field(..., description="Tingkat risiko tool yang diverifikasi")
     reasons: Tuple[str, ...] = Field(
         default=(),
-        description="Daftar alasan penolakan dalam Bahasa Indonesia (kosong bila APPROVED)"
+        description="Daftar alasan penolakan dalam Bahasa Indonesia (wajib kosong bila APPROVED)"
     )
     verifier_id: str = Field(..., description="Identifikasi unik kelas/engine verifier")
     deterministic_only: bool = Field(
@@ -91,7 +90,10 @@ class VerificationVerdict(BaseModel):
     @model_validator(mode="after")
     def validate_status_reasons(self) -> "VerificationVerdict":
         if self.status == "APPROVED" and len(self.reasons) > 0:
-            object.__setattr__(self, "reasons", ())
+            raise ValueError(
+                f"VerificationVerdict dengan status 'APPROVED' tidak boleh memiliki reasons, "
+                f"didapat {len(self.reasons)} alasan: {self.reasons}."
+            )
         return self
 
 
@@ -154,7 +156,7 @@ class DeterministicVerifier:
     def __init__(
         self,
         allowed_root: Optional[str] = None,
-        max_string_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_string_bytes: Optional[int] = None,
         path_argument_names: Tuple[str, ...] = (
             "path", "file_path", "filepath", "filename", "file",
             "directory", "dir", "output_path", "target_path"
@@ -168,7 +170,13 @@ class DeterministicVerifier:
         self.allowed_root: Optional[str] = (
             os.path.abspath(allowed_root) if allowed_root else None
         )
-        self.max_string_bytes: int = max_string_bytes
+        if max_string_bytes is None:
+            # Lazy import di dalam konstruktor untuk memutus rantai circular dependency modul
+            from LegionADK.tools.output_spill_guard import DEFAULT_MAX_OUTPUT_BYTES
+            self.max_string_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+        else:
+            self.max_string_bytes = max_string_bytes
+
         self.path_argument_names: Tuple[str, ...] = tuple(path_argument_names)
         self.command_argument_names: Tuple[str, ...] = tuple(command_argument_names)
         self.max_consecutive_rejections: int = max_consecutive_rejections
@@ -208,8 +216,8 @@ class DeterministicVerifier:
         2. Kumpulkan semua nilai string rekursif dari arguments.
         3. Terapkan aturan:
            - Semua string: periksa byte nul (\x00) dan panjang maksimum bytes.
-           - Argumen bernama path: periksa path traversal ('../', '..\\') dan batas allowed_root.
-           - Argumen bernama perintah: periksa pola injeksi shell (&&, ||, $(, backtick, ; diikuti teks).
+           - Argumen bernama path: periksa segmen path traversal ('..') dan batas allowed_root.
+           - Argumen bernama perintah: periksa pola injeksi/pemisah shell ('|', '&', ';', newline, backtick, '$(').
            - Argumen lain (content, query, dll): tidak diperiksa traversal/injeksi.
         4. Jika tidak ada pelanggaran: kembalikan APPROVED dan reset counter penolakan.
         5. Jika ada pelanggaran: kembalikan REJECTED, naikkan counter, dan evaluasi limit_reached / escalation.
@@ -255,10 +263,13 @@ class DeterministicVerifier:
 
             # Aturan B: Hanya argumen bernama path
             if arg_name_lower in self._path_names_set:
-                # Periksa pola path traversal
-                if "../" in val or "..\\" in val:
+                # Periksa pola path traversal: pecah segmen berdasarkan '/' dan '\'
+                # Menangkap '..', 'sub/..', '..\\dir', dan '../path'
+                normalized_path = val.replace("\\", "/")
+                segments = [seg.strip() for seg in normalized_path.split("/") if seg.strip()]
+                if ".." in segments:
                     reasons.append(
-                        f"Argumen '{clean_arg_name}' ditolak: mengandung pola path traversal '../' atau '..\\'."
+                        f"Argumen '{clean_arg_name}' ditolak: mengandung pola path traversal '..' pada segmen path."
                     )
 
                 # Periksa path absolut terhadap allowed_root
@@ -281,7 +292,8 @@ class DeterministicVerifier:
             if arg_name_lower in self._cmd_names_set:
                 if COMMAND_INJECTION_PATTERN.search(val):
                     reasons.append(
-                        f"Argumen '{clean_arg_name}' ditolak: mengandung pola injeksi perintah shell ('&&', '||', '$(', backtick, atau ';')."
+                        f"Argumen '{clean_arg_name}' ditolak: mengandung karakter/operator pemisah perintah shell "
+                        f"('|', '&', ';', newline, backtick, atau '$(')."
                     )
 
         tracking_key = (session_id, canonical_tool_name)
@@ -304,7 +316,9 @@ class DeterministicVerifier:
         self._rejection_counts[tracking_key] = current_rejections
         limit_reached = current_rejections >= self.max_consecutive_rejections
 
-        if limit_reached:
+        # Callback on_escalation hanya dipanggil tepat satu kali saat batas penolakan pertama kali tercapai
+        is_first_escalation = current_rejections == self.max_consecutive_rejections
+        if is_first_escalation:
             logger.warning(
                 f"[CoVVerifier] Batas penolakan berturut-turut tercapai untuk session '{session_id}' "
                 f"pada tool '{canonical_tool_name}' ({current_rejections}/{self.max_consecutive_rejections})."
