@@ -329,8 +329,11 @@ def summarize_oldest_history(
     # Cegah dua pesan berurutan dengan role sama jika tail_slice diawali pesan user
     if tail_slice and tail_slice[0].get("role") == summary_role:
         first_tail = copy.deepcopy(tail_slice[0])
-        first_tail_content = str(first_tail.get("content", ""))
-        first_tail["content"] = f"{summary_text}\n\n{first_tail_content}"
+        first_tail_content = first_tail.get("content", "")
+        if isinstance(first_tail_content, list):
+            first_tail["content"] = [{"type": "text", "text": summary_text}] + first_tail_content
+        else:
+            first_tail["content"] = f"{summary_text}\n\n{str(first_tail_content)}"
         result.append(first_tail)
         result.extend(copy.deepcopy(tail_slice[1:]))
     else:
@@ -364,8 +367,8 @@ def _apply_emergency_tail_truncation(
         for i, m in enumerate(truncated_messages):
             # Langkah 3: Gunakan _is_immutable_system_anchor agar blok ringkasan
             # juga bisa dirampingkan jika ekor sudah habis terpangkas.
-            if not _is_immutable_system_anchor(m):
-                c_len = len(str(m.get("content", "")))
+            if not _is_immutable_system_anchor(m) and isinstance(m.get("content"), str):
+                c_len = len(m["content"])
                 if c_len > max_chars:
                     max_chars = c_len
                     longest_idx = i
