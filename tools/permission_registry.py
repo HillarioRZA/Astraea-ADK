@@ -71,7 +71,7 @@ class ToolExecutionError(ToolRegistryError, RuntimeError):
 
 
 # ============================================================================
-# 2. Deep-Freeze Utilities
+# 2. Deep-Freeze Utilities & Defaults
 # ============================================================================
 
 def _deep_freeze(obj: Any) -> Any:
@@ -92,6 +92,11 @@ def _deep_unfreeze(obj: Any) -> Any:
     return obj
 
 
+# Skema bawaan deep-frozen: menjamin required dan properties tidak dapat dimutasi secara in-place
+DEFAULT_PARAMETERS_SCHEMA: Mapping[str, Any] = _deep_freeze(
+    {"type": "object", "properties": {}, "required": []}
+)
+
 # Regex untuk memvalidasi format name (namespace:action)
 TOOL_NAME_REGEX = re.compile(r"^[a-zA-Z0-9_-]+:[a-zA-Z0-9_.-]+$")
 
@@ -104,8 +109,18 @@ class ToolSpec(BaseModel):
     """
     Kontrak spesifikasi perkakas (Tool) LegionADK.
     Deep-frozen dan immutable untuk menjamin konsistensi state dan thread-safety.
+    
+    Catatan arsitektur:
+    - 'name': Dinormalisasi secara kanonis ke lowercase untuk mencegah ketidakcocokan casing.
+    - 'risk_tier': Tingkat risiko (0=safe, 1=moderate, 2=critical) disiapkan untuk human-in-the-loop
+      dan policy guard di level orkestrasi runtime.
     """
-    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        arbitrary_types_allowed=True,
+        validate_default=True,
+    )
 
     name: str = Field(
         ...,
@@ -116,7 +131,7 @@ class ToolSpec(BaseModel):
         description="Penjelasan fungsionalitas dan instruksi pemakaian tool"
     )
     parameters_schema: Mapping[str, Any] = Field(
-        default_factory=lambda: MappingProxyType({"type": "object", "properties": {}, "required": []}),
+        default_factory=lambda: DEFAULT_PARAMETERS_SCHEMA,
         description="JSON Schema valid untuk parameter tool (read-only mapping)"
     )
     risk_tier: Literal[0, 1, 2] = Field(
@@ -131,7 +146,7 @@ class ToolSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        cleaned = v.strip()
+        cleaned = v.strip().lower()
         if not TOOL_NAME_REGEX.match(cleaned):
             raise ValueError(
                 f"Nama tool '{v}' tidak valid. Wajib berformat 'namespace:action' "
@@ -143,7 +158,7 @@ class ToolSpec(BaseModel):
     @classmethod
     def freeze_parameters_schema(cls, v: Any) -> Mapping[str, Any]:
         if v is None:
-            v = {"type": "object", "properties": {}, "required": []}
+            return DEFAULT_PARAMETERS_SCHEMA
         return _deep_freeze(v)
 
     @field_serializer("parameters_schema", when_used="always")
@@ -159,8 +174,8 @@ _TOOL_REGISTRY: Dict[str, ToolSpec] = {}
 
 
 def get_registered_tool(tool_name: str) -> Optional[ToolSpec]:
-    """Mengambil ToolSpec dari registry berdasarkan nama tool."""
-    return _TOOL_REGISTRY.get(tool_name.strip())
+    """Mengambil ToolSpec dari registry berdasarkan nama tool (case-insensitive)."""
+    return _TOOL_REGISTRY.get(tool_name.strip().lower())
 
 
 def list_registered_tools() -> List[ToolSpec]:
@@ -169,8 +184,8 @@ def list_registered_tools() -> List[ToolSpec]:
 
 
 def unregister_tool(tool_name: str) -> bool:
-    """Menghapus tool dari registry berdasarkan nama. Mengembalikan True jika ada yang dihapus."""
-    cleaned = tool_name.strip()
+    """Menghapus tool dari registry berdasarkan nama (case-insensitive). Mengembalikan True jika ada yang dihapus."""
+    cleaned = tool_name.strip().lower()
     if cleaned in _TOOL_REGISTRY:
         del _TOOL_REGISTRY[cleaned]
         logger.info(f"[PermissionRegistry] Tool '{cleaned}' berhasil dihapus dari registry.")
@@ -185,7 +200,11 @@ def clear_tool_registry() -> None:
 
 
 @overload
-def register_tool(tool: ToolSpec) -> ToolSpec: ...
+def register_tool(
+    tool: ToolSpec,
+    *,
+    allow_overwrite: bool = True,
+) -> ToolSpec: ...
 
 @overload
 def register_tool(
@@ -196,6 +215,7 @@ def register_tool(
     parameters_schema: Optional[Dict[str, Any]] = None,
     risk_tier: Literal[0, 1, 2] = 0,
     handler: Optional[Callable[..., Any]] = None,
+    allow_overwrite: bool = True,
 ) -> Union[ToolSpec, Callable[[Callable[..., Any]], ToolSpec]]: ...
 
 
@@ -207,6 +227,7 @@ def register_tool(
     parameters_schema: Optional[Dict[str, Any]] = None,
     risk_tier: Literal[0, 1, 2] = 0,
     handler: Optional[Callable[..., Any]] = None,
+    allow_overwrite: bool = True,
 ) -> Union[ToolSpec, Callable[[Callable[..., Any]], ToolSpec]]:
     """
     Mendaftarkan tool ke in-memory registry. Mendukung 3 mode pemanggilan:
@@ -216,7 +237,14 @@ def register_tool(
     """
     # Kasus 1: Diberikan langsung objek ToolSpec
     if isinstance(tool, ToolSpec):
-        _TOOL_REGISTRY[tool.name] = tool
+        tool_name = tool.name
+        if tool_name in _TOOL_REGISTRY:
+            if not allow_overwrite:
+                raise ValueError(
+                    f"Tool '{tool_name}' sudah terdaftar di registry. Set allow_overwrite=True jika ingin menimpa."
+                )
+            logger.warning(f"[PermissionRegistry] Tool '{tool_name}' sudah terdaftar sebelumnya. Menimpa handler lama.")
+        _TOOL_REGISTRY[tool_name] = tool
         logger.info(f"[PermissionRegistry] Tool '{tool.name}' (tier {tool.risk_tier}) didaftarkan.")
         return tool
 
@@ -235,7 +263,7 @@ def register_tool(
         else:
             desc = description.strip()
 
-        schema = parameters_schema or {"type": "object", "properties": {}, "required": []}
+        schema = parameters_schema or DEFAULT_PARAMETERS_SCHEMA
         spec = ToolSpec(
             name=name,
             description=desc,
@@ -243,6 +271,13 @@ def register_tool(
             risk_tier=risk_tier,
             handler=fn,
         )
+        if spec.name in _TOOL_REGISTRY:
+            if not allow_overwrite:
+                raise ValueError(
+                    f"Tool '{spec.name}' sudah terdaftar di registry. Set allow_overwrite=True jika ingin menimpa."
+                )
+            logger.warning(f"[PermissionRegistry] Tool '{spec.name}' sudah terdaftar sebelumnya. Menimpa handler lama.")
+
         _TOOL_REGISTRY[spec.name] = spec
         logger.info(f"[PermissionRegistry] Tool '{spec.name}' (tier {spec.risk_tier}) didaftarkan via decorator.")
         return spec
@@ -262,31 +297,31 @@ def authorize_tool_call(spec: LLMSpec, tool_name: str) -> bool:
     """
     Mengecek izin pemanggilan terhadap spec.tool_permissions di memori.
     Mendukung:
-    - Pencocokan persis ("graph:locate" == "graph:locate")
-    - Pencocokan wildcard namespace ("graph:*" cocok dengan "graph:locate", "graph:query")
-    - Pencocokan universal wildcard ("*" atau "all" mengizinkan semua tool)
+    - Pencocokan persis (case-insensitive: "graph:locate" == "Graph:Locate")
+    - Pencocokan wildcard namespace (case-insensitive: "graph:*" cocok dengan "graph:locate", "graph:query")
+    - Pencocokan universal wildcard ("*" atau case-insensitive "all" / "ALL")
 
     Jika spec.tool_permissions bernilai None atau kosong, mengembalikan False.
     """
     if not spec.tool_permissions:
         return False
 
-    clean_tool = tool_name.strip()
-    tool_ns = clean_tool.split(":", 1)[0].lower() if ":" in clean_tool else ""
+    clean_tool = tool_name.strip().lower()
+    tool_ns = clean_tool.split(":", 1)[0] if ":" in clean_tool else ""
 
     for perm in spec.tool_permissions:
-        p = perm.strip()
-        # 1. Universal wildcard
+        p = perm.strip().lower()
+        # 1. Universal wildcard ("*" atau "all" dalam segala bentuk kapitalisasi)
         if p in ("*", "all"):
             return True
 
         # 2. Exact match (case-insensitive)
-        if p.lower() == clean_tool.lower():
+        if p == clean_tool:
             return True
 
         # 3. Namespace wildcard (e.g. "graph:*")
         if p.endswith(":*"):
-            perm_ns = p[:-2].strip().lower()
+            perm_ns = p[:-2].strip()
             if perm_ns and perm_ns == tool_ns:
                 return True
 
@@ -376,14 +411,14 @@ async def execute_registered_tool(
     """
     Pipeline eksekusi tool aman dengan tahapan:
     1. Validasi izin RBAC terhadap spec.tool_permissions.
-    2. Verifikasi keberadaan tool di in-memory registry.
+    2. Verifikasi keberadaan tool di in-memory registry (case-insensitive).
     3. Periksa CancellationToken (tunggu jika pause, batalkan jika cancelled).
     4. Validasi argumen pemanggilan terhadap parameters_schema.
     5. Jalankan fungsi handler (asinkron langsung atau sinkron via asyncio.to_thread).
     6. Periksa CancellationToken pasca-eksekusi.
     7. Teruskan hasil keluaran ke Output Spill Guard (batas keras 50 KB).
     """
-    clean_name = tool_name.strip()
+    clean_name = tool_name.strip().lower()
 
     # 1. Validasi Izin RBAC
     if not authorize_tool_call(spec, clean_name):
@@ -440,6 +475,7 @@ async def execute_registered_tool(
 
 
 __all__ = [
+    "DEFAULT_PARAMETERS_SCHEMA",
     "ToolSpec",
     "ToolRegistryError",
     "ToolPermissionError",

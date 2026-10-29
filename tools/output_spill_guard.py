@@ -6,6 +6,12 @@ Jika melampaui batas, memotong teks tepat pada batas aman UTF-8 (tanpa merusak m
 menyimpan output mentah lengkap ke direktori .astraea_spill/, menyematkan penanda
 [OUTPUT_TRUNCATED_EXCEEDED_50KB] beserta path berkas log, serta menjalankan pemangkas berkas
 kadaluwarsa secara otomatis.
+
+Catatan Desain:
+- Strict Budgeting: Panjang marker dihitung dan dikurangkan dari max_bytes sebelum pemotongan teks,
+  sehingga total payload kembalian (teks terpotong + marker) dijamin matematis <= max_bytes (51.200 bytes).
+- Binary vs Text: Spill guard ditujukan untuk teks kontekstual agentic. Tool yang mengembalikan biner
+  murni (misal gambar) sebaiknya menggunakan envelope asset/base64 atau path referensi langsung.
 """
 
 from __future__ import annotations
@@ -86,11 +92,32 @@ def _write_file_sync(file_path: str, data: bytes) -> None:
         f.write(data)
 
 
-def _read_file_sync(file_path: str) -> str:
-    """Helper sinkron pembacaan berkas teks."""
-    if not os.path.exists(file_path):
+def _read_file_sync(file_path: str, spill_dir: Optional[str] = None) -> str:
+    """
+    Helper sinkron pembacaan berkas teks.
+    Memeriksa nama berkas dan path containment untuk mencegah directory traversal.
+    """
+    # Validasi nama berkas spill log secara defensif terlebih dahulu
+    fname = os.path.basename(file_path)
+    if not fname.startswith("spill_") or not fname.endswith(".log"):
+        raise ValueError(
+            f"Akses ditolak: '{file_path}' bukan berkas spill log yang valid "
+            "(harus diawali 'spill_' dan berakhiran '.log')."
+        )
+
+    abs_path = os.path.abspath(file_path)
+    if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Spill log file not found: {file_path}")
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+
+    # Validasi direktori induk agar tetap berada dalam base spill dir jika ditentukan
+    if spill_dir:
+        expected_base = os.path.abspath(spill_dir)
+        if not abs_path.startswith(expected_base):
+            raise PermissionError(
+                f"Akses ditolak: '{file_path}' berada di luar direktori spill '{expected_base}'."
+            )
+
+    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
@@ -197,7 +224,7 @@ def _normalize_to_bytes(raw_output: Any) -> bytes:
         return raw_output.encode("utf-8")
     if isinstance(raw_output, (dict, list, tuple)):
         try:
-            return json.dumps(raw_output, ensure_ascii=False, indent=2).encode("utf-8")
+            return json.dumps(raw_result if (raw_result := raw_output) else raw_output, ensure_ascii=False, indent=2).encode("utf-8")
         except (TypeError, ValueError):
             return str(raw_output).encode("utf-8")
     return str(raw_output).encode("utf-8")
@@ -212,8 +239,9 @@ def process_output_sync(
     """
     Versi sinkron untuk mengevaluasi ukuran output tool:
     - Jika <= max_bytes: dikembalikan utuh tanpa truncating.
-    - Jika > max_bytes: dipotong pada batas aman UTF-8, disimpan ke disk di .astraea_spill/,
-      dan disematkan penanda [OUTPUT_TRUNCATED_EXCEEDED_50KB] beserta path berkas lengkap.
+    - Jika > max_bytes: teks dipotong tepat pada batas aman UTF-8 dengan memperhitungkan
+      alokasi byte untuk penanda, disimpan ke disk di .astraea_spill/, dan menjamin
+      total content (teks + penanda) <= max_bytes.
     """
     raw_bytes = _normalize_to_bytes(raw_output)
     total_bytes = len(raw_bytes)
@@ -226,11 +254,7 @@ def process_output_sync(
             total_bytes=total_bytes,
         )
 
-    # 1. Potong tepat pada batas aman UTF-8
-    safe_truncated_bytes = truncate_utf8_bytes(raw_bytes, max_bytes)
-    truncated_text = safe_truncated_bytes.decode("utf-8", errors="ignore")
-
-    # 2. Siapkan direktori dan berkas spill log
+    # 1. Siapkan direktori dan berkas spill log
     base_dir = spill_dir or _get_default_spill_dir()
     sess_tag = _sanitize_session_id(session_id)
     timestamp = int(time.time())
@@ -238,21 +262,26 @@ def process_output_sync(
     filename = f"spill_{sess_tag}_{timestamp}_{rand_suffix}.log"
     spill_path = os.path.abspath(os.path.join(base_dir, filename))
 
-    # 3. Tulis seluruh raw_bytes mentah ke disk
+    # 2. Tulis seluruh raw_bytes mentah ke disk
     _write_file_sync(spill_path, raw_bytes)
     logger.warning(
         f"[SpillGuard] Output tool melampaui batas aman ({total_bytes} bytes > {max_bytes} bytes). "
         f"Output lengkap disimpan ke: {spill_path}"
     )
 
-    # 4. Sematkan penanda beserta path berkas log lengkap
-    content_with_marker = (
-        f"{truncated_text}\n\n"
-        f"{TRUNCATION_MARKER}\n"
+    # 3. Hitung alokasi marker dan potong teks agar total bytes <= max_bytes
+    marker_text = (
+        f"\n\n{TRUNCATION_MARKER}\n"
         f"Full output ({total_bytes} bytes) spilled to: {spill_path}\n"
     )
+    marker_bytes = marker_text.encode("utf-8")
+    available_text_bytes = max(0, max_bytes - len(marker_bytes))
 
-    # 5. Otomatis pangkas berkas kadaluwarsa
+    safe_truncated_bytes = truncate_utf8_bytes(raw_bytes, available_text_bytes)
+    truncated_text = safe_truncated_bytes.decode("utf-8", errors="ignore")
+    content_with_marker = f"{truncated_text}{marker_text}"
+
+    # 4. Otomatis pangkas berkas kadaluwarsa
     _prune_spill_cache_sync(base_dir)
 
     return SpillResult(
@@ -271,7 +300,8 @@ async def process_output(
 ) -> SpillResult:
     """
     Versi asinkron untuk mengevaluasi ukuran output tool:
-    Menjalankan operasi I/O disk di threadpool terpisah via asyncio.to_thread.
+    Menjalankan operasi I/O disk di threadpool terpisah via asyncio.to_thread,
+    dengan alokasi ketat agar total teks + penanda <= max_bytes.
     """
     raw_bytes = _normalize_to_bytes(raw_output)
     total_bytes = len(raw_bytes)
@@ -284,11 +314,7 @@ async def process_output(
             total_bytes=total_bytes,
         )
 
-    # 1. Potong tepat pada batas aman UTF-8
-    safe_truncated_bytes = truncate_utf8_bytes(raw_bytes, max_bytes)
-    truncated_text = safe_truncated_bytes.decode("utf-8", errors="ignore")
-
-    # 2. Siapkan direktori dan berkas spill log
+    # 1. Siapkan direktori dan berkas spill log
     base_dir = spill_dir or _get_default_spill_dir()
     sess_tag = _sanitize_session_id(session_id)
     timestamp = int(time.time())
@@ -296,21 +322,26 @@ async def process_output(
     filename = f"spill_{sess_tag}_{timestamp}_{rand_suffix}.log"
     spill_path = os.path.abspath(os.path.join(base_dir, filename))
 
-    # 3. Tulis seluruh raw_bytes ke disk via threadpool
+    # 2. Tulis seluruh raw_bytes ke disk via threadpool
     await asyncio.to_thread(_write_file_sync, spill_path, raw_bytes)
     logger.warning(
         f"[SpillGuard] Output tool melampaui batas aman ({total_bytes} bytes > {max_bytes} bytes). "
         f"Output lengkap disimpan ke: {spill_path}"
     )
 
-    # 4. Sematkan penanda beserta path berkas log lengkap
-    content_with_marker = (
-        f"{truncated_text}\n\n"
-        f"{TRUNCATION_MARKER}\n"
+    # 3. Hitung alokasi marker dan potong teks agar total bytes <= max_bytes
+    marker_text = (
+        f"\n\n{TRUNCATION_MARKER}\n"
         f"Full output ({total_bytes} bytes) spilled to: {spill_path}\n"
     )
+    marker_bytes = marker_text.encode("utf-8")
+    available_text_bytes = max(0, max_bytes - len(marker_bytes))
 
-    # 5. Otomatis pangkas berkas kadaluwarsa
+    safe_truncated_bytes = truncate_utf8_bytes(raw_bytes, available_text_bytes)
+    truncated_text = safe_truncated_bytes.decode("utf-8", errors="ignore")
+    content_with_marker = f"{truncated_text}{marker_text}"
+
+    # 4. Otomatis pangkas berkas kadaluwarsa
     await prune_spill_cache(base_dir)
 
     return SpillResult(
@@ -329,7 +360,7 @@ async def guard_tool_output(
 ) -> str:
     """
     Universal Asynchronous Guard:
-    Mengembalikan teks aman yang dijamin <= 50 KB (+ marker penanda jika terpotong).
+    Mengembalikan teks aman yang dijamin strictly <= 50 KB (termasuk marker penanda).
     """
     res = await process_output(
         raw_output=raw_output,
@@ -348,7 +379,7 @@ def guard_tool_output_sync(
 ) -> str:
     """
     Universal Synchronous Guard:
-    Mengembalikan teks aman yang dijamin <= 50 KB (+ marker penanda jika terpotong).
+    Mengembalikan teks aman yang dijamin strictly <= 50 KB (termasuk marker penanda).
     """
     res = process_output_sync(
         raw_output=raw_output,
@@ -359,14 +390,14 @@ def guard_tool_output_sync(
     return res.content
 
 
-async def read_spilled_output(spill_path: str) -> str:
+async def read_spilled_output(spill_path: str, spill_dir: Optional[str] = None) -> str:
     """Membaca kembali isi lengkap berkas spill dari disk secara asinkron."""
-    return await asyncio.to_thread(_read_file_sync, spill_path)
+    return await asyncio.to_thread(_read_file_sync, spill_path, spill_dir)
 
 
-def read_spilled_output_sync(spill_path: str) -> str:
+def read_spilled_output_sync(spill_path: str, spill_dir: Optional[str] = None) -> str:
     """Membaca kembali isi lengkap berkas spill dari disk secara sinkron."""
-    return _read_file_sync(spill_path)
+    return _read_file_sync(spill_path, spill_dir)
 
 
 __all__ = [
