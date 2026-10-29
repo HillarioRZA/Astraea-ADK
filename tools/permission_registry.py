@@ -33,7 +33,7 @@ from typing import (
 )
 
 # pyrefly: ignore[missing-import]
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from LegionADK.core.llm_spec import CancellationToken, LLMSpec
 from LegionADK.tools.output_spill_guard import guard_tool_output
@@ -154,16 +154,19 @@ class ToolSpec(BaseModel):
             )
         return cleaned
 
-    @field_validator("parameters_schema", mode="before")
-    @classmethod
-    def freeze_parameters_schema(cls, v: Any) -> Mapping[str, Any]:
-        if v is None:
-            return DEFAULT_PARAMETERS_SCHEMA
-        return _deep_freeze(v)
+    @model_validator(mode="after")
+    def freeze_parameters_schema_after(self) -> "ToolSpec":
+        schema = self.parameters_schema if self.parameters_schema is not None else DEFAULT_PARAMETERS_SCHEMA
+        object.__setattr__(self, "parameters_schema", _deep_freeze(schema))
+        return self
 
     @field_serializer("parameters_schema", when_used="always")
     def serialize_parameters_schema(self, v: Any) -> Dict[str, Any]:
         return _deep_unfreeze(v)
+
+    @field_serializer("handler", when_used="json")
+    def serialize_handler(self, v: Callable[..., Any]) -> str:
+        return getattr(v, "__name__", repr(v))
 
 
 # ============================================================================
